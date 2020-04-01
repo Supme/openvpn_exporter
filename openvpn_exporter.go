@@ -1,24 +1,23 @@
 package main
 
 import (
+	"bufio"
 	"flag"
-	"net/http"
-	"os"
+	"fmt"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/common/log"
-	"time"
-	"regexp"
-	"io/ioutil"
-	"strings"
-	"encoding/json"
+	"net/http"
+	"os"
 	"strconv"
+	"strings"
+	"time"
 )
 
 var (
-	ListenAddr = flag.String("listenaddr", ":9509", "ovpnserver_exporter listen address")
+	ListenAddr  = flag.String("listenaddr", ":9509", "ovpnserver_exporter listen address")
 	MetricsPath = flag.String("metricspath", "/metrics", "URL path for surfacing collected metrics")
-	ovpnlog = flag.String("ovpn.log", "/var/log/status.log", "Absolute path for OpenVPN server log")
+	ovpnlog     = flag.String("ovpn.log", "/var/log/status.log", "Absolute path for OpenVPN server log")
 )
 
 var (
@@ -27,36 +26,33 @@ var (
 		Help: "Current OpenVPN logged in users",
 	})
 	ovpnmaxbcastmcastqueue = prometheus.NewGauge(prometheus.GaugeOpts{
-                Name: "ovpn_maxmacatbcastqueue",
-                Help: "Current Max Broadcast/Multicast queue",
-        })
+		Name: "ovpn_maxmacatbcastqueue",
+		Help: "Current Max Broadcast/Multicast queue",
+	})
 	ovpnremote = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-                Name: "ovpn_remote",
-                Help: "OpenVPN users statistics",
-        },
-	[]string{"client","ip"},
+		Name: "ovpn_remote",
+		Help: "OpenVPN users statistics",
+	},
+		[]string{"client", "ip"},
 	)
 	ovpnbytesr = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-                Name: "ovpn_bytesr",
-                Help: "OpenVPN user Bytes Received",
-        },
-        []string{"client", "number"},
-        )
-        ovpnbytess = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-                Name: "ovpn_bytess",
-                Help: "OpenVPN user Bytes Sent",
-        },
-        []string{"client", "number"},
-        )
-        ovpnrouting = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-                Name: "ovpn_routing",
-                Help: "OpenVPN Routing Table",
-        },
-        []string{"record_number", "client", "local_ip", "remote_ip"},
-        )
-
-
-
+		Name: "ovpn_bytesr",
+		Help: "OpenVPN user Bytes Received",
+	},
+		[]string{"client", "number"},
+	)
+	ovpnbytess = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "ovpn_bytess",
+		Help: "OpenVPN user Bytes Sent",
+	},
+		[]string{"client", "number"},
+	)
+	ovpnrouting = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "ovpn_routing",
+		Help: "OpenVPN Routing Table",
+	},
+		[]string{"record_number", "client", "local_ip", "remote_ip"},
+	)
 )
 
 const (
@@ -65,91 +61,179 @@ const (
 
 func init() {
 	prometheus.MustRegister(ovpnclientscount)
-        prometheus.MustRegister(ovpnmaxbcastmcastqueue)
+	prometheus.MustRegister(ovpnmaxbcastmcastqueue)
 	prometheus.MustRegister(ovpnremote)
 	prometheus.MustRegister(ovpnbytesr)
-        prometheus.MustRegister(ovpnbytess)
-        prometheus.MustRegister(ovpnrouting)
+	prometheus.MustRegister(ovpnbytess)
+	prometheus.MustRegister(ovpnrouting)
 }
 
 type Body struct {
-	Updated string `json:"updated"`
-	Clients []struct {
-		Client        string `json:"client"`
-		Remote        string `json:"remote"`
-		BytesReceived string `json:"bytes_received"`
-		BytesSent     string `json:"bytes_sent"`
-	} `json:"clients"`
-	Routing []struct {
-		LocalIP string `json:"local_ip"`
-		Client  string `json:"client"`
-		RealIP  string `json:"real_ip"`
-	} `json:"routing"`
-	MaxBcastMcastQueue string `json:"max_bcast_mcast_queue"`
+	Updated            string    `json:"updated"`
+	Clients            []Client  `json:"clients"`
+	Routs              []Routing `json:"routing"`
+	MaxBcastMcastQueue string    `json:"max_bcast_mcast_queue"`
+}
+
+type Client struct {
+	Client        string `json:"client"`
+	Remote        string `json:"remote"`
+	BytesReceived string `json:"bytes_received"`
+	BytesSent     string `json:"bytes_sent"`
+}
+
+type Routing struct {
+	LocalIP string `json:"local_ip"`
+	Client  string `json:"client"`
+	RealIP  string `json:"real_ip"`
+}
+
+func (b *Body) Parse(logfile string) error {
+	file, err := os.OpenFile(logfile, os.O_RDONLY, 0444)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	scanner := bufio.NewScanner(file)
+	scanner.Split(bufio.ScanLines)
+	var section string
+	for scanner.Scan() {
+		switch section {
+		case "":
+			if scanner.Text() != "OpenVPN CLIENT LIST" {
+				return fmt.Errorf("unknow first line format")
+			}
+			section = "updated"
+			break
+
+		case "updated":
+			fields := strings.Split(scanner.Text(), ",")
+			if len(fields) != 2 {
+				return fmt.Errorf("unknow second line format")
+			}
+			t, err := time.Parse(time_layout, fields[1])
+			if err != nil {
+				return fmt.Errorf("parse update time: %s", err)
+			}
+			b.Updated = t.String()
+			section = "client header"
+			break
+
+		case "client header":
+			fields := strings.Split(scanner.Text(), ",")
+			if len(fields) != 5 {
+				return fmt.Errorf("parse clients header fields count not eq 5")
+			}
+			section = "clients"
+			break
+
+		case "clients":
+			for scanner.Scan() {
+				s := scanner.Text()
+				if s == "ROUTING TABLE" {
+					section = "routing header"
+					break
+				}
+				fields := strings.Split(s, ",")
+				if len(fields) != 5 {
+					return fmt.Errorf("parse client line %s", s)
+				}
+				b.Clients = append(
+					b.Clients,
+					Client{
+						Client:        fields[0],
+						Remote:        fields[1],
+						BytesReceived: fields[2],
+						BytesSent:     fields[3],
+					})
+			}
+			break
+
+		case "routing header":
+			fields := strings.Split(scanner.Text(), ",")
+			if len(fields) != 4 {
+				return fmt.Errorf("parse routing header fields count not eq 4")
+			}
+			section = "routing table"
+			break
+
+		case "routing table":
+			for scanner.Scan() {
+				s := scanner.Text()
+				if s == "GLOBAL STATS" {
+					section = "global stats"
+					break
+				}
+				fields := strings.Split(s, ",")
+				if len(fields) != 4 {
+					return fmt.Errorf("parse routing line %s", s)
+				}
+				b.Routs = append(
+					b.Routs,
+					Routing{
+						LocalIP: fields[0],
+						Client:  fields[1],
+						RealIP:  fields[2],
+					})
+			}
+			break
+
+		case "global stats":
+			fields := strings.Split(scanner.Text(), ",")
+			if len(fields) != 2 {
+				return fmt.Errorf("unknow second line format")
+			}
+			b.MaxBcastMcastQueue = fields[1]
+			section = "end"
+			break
+
+		case "end":
+			if scanner.Text() != "END" {
+				return fmt.Errorf("not find end")
+			}
+			break
+		}
+	}
+	return scanner.Err()
 }
 
 func main() {
 	flag.Parse()
-        if *ovpnlog == "" { log.Fatal("OpenVPN status log absolute path must be set with '-ovpn.log' flag") }
-        if _, err := os.Stat(*ovpnlog); os.IsNotExist(err) { log.Fatal("File: ",*ovpnlog," does not exists")}
-	var landingPage = []byte(`<html><head><title>OpenVPN exporter exporter</title></head><body><h1>OpenVPN server stats exporter</h1><p><a href='` + *MetricsPath + `'>Metrics</a></p></body></html>`)
+	if *ovpnlog == "" {
+		log.Fatal("OpenVPN status log absolute path must be set with '-ovpn.log' flag")
+	}
+	if _, err := os.Stat(*ovpnlog); os.IsNotExist(err) {
+		log.Fatal("File: ", *ovpnlog, " does not exists")
+	}
+
 	go func() {
 		for {
-			byt := []byte(convert_ovpn_status(*ovpnlog))
-			b := &Body{}
-			json.Unmarshal(byt, b)
+			var b Body
+			if err := b.Parse(*ovpnlog); err != nil {
+				log.Fatal("Parse log: ", err)
+			}
 			strmcast, _ := strconv.ParseFloat(b.MaxBcastMcastQueue, 64)
 			ovpnclientscount.Set(float64(len(b.Clients)))
 			ovpnmaxbcastmcastqueue.Set(strmcast)
 			for i, _ := range b.Clients {
 				bytesr, _ := strconv.Atoi(b.Clients[i].BytesReceived)
 				bytess, _ := strconv.Atoi(b.Clients[i].BytesSent)
-				ovpnremote.WithLabelValues(b.Clients[i].Client, b.Clients[i].Remote).Set(float64(i+1))
+				ovpnremote.WithLabelValues(b.Clients[i].Client, b.Clients[i].Remote).Set(float64(i + 1))
 				ovpnbytesr.WithLabelValues(b.Clients[i].Client, strconv.Itoa(i+1)).Set(float64(bytesr))
-                                ovpnbytess.WithLabelValues(b.Clients[i].Client, strconv.Itoa(i+1)).Set(float64(bytess))
+				ovpnbytess.WithLabelValues(b.Clients[i].Client, strconv.Itoa(i+1)).Set(float64(bytess))
 			}
-                        for i, _ := range b.Routing {
-                                ovpnrouting.WithLabelValues(strconv.Itoa(i+1), b.Routing[i].Client, b.Routing[i].LocalIP, b.Routing[i].RealIP)
+			for i, _ := range b.Routs {
+				ovpnrouting.WithLabelValues(strconv.Itoa(i+1), b.Routs[i].Client, b.Routs[i].LocalIP, b.Routs[i].RealIP)
 			}
- 
+
 			time.Sleep(time.Duration(1000 * time.Millisecond))
 		}
 	}()
-        http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { w.Write(landingPage) } )
-        http.Handle(*MetricsPath, promhttp.Handler())
-        log.Info("Listening on: ", *ListenAddr)
-        log.Fatal(http.ListenAndServe(*ListenAddr, nil))
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`<html><head><title>OpenVPN exporter exporter</title></head><body><h1>OpenVPN server stats exporter</h1><p><a href='` + *MetricsPath + `'>Metrics</a></p></body></html>`))
+	})
+	http.Handle(*MetricsPath, promhttp.Handler())
+	log.Info("Listening on: ", *ListenAddr)
+	log.Fatal(http.ListenAndServe(*ListenAddr, nil))
 
-}
-
-func time_convert(times string) time.Time {
-        t2, _ := time.Parse(time_layout, times)
-        return t2
-}
-
-func convert_ovpn_status(logfile string) string {
-        b, _:= ioutil.ReadFile(logfile)
-	var resultstring,resclient,resroute,resline string
-        lines := strings.Split(string(b), "\n")
-        for _, line := range lines { resline = resline + " " + line }
-        reg := regexp.MustCompile("OpenVPN CLIENT LIST Updated,(.*?) Common Name,Real Address,Bytes Received,Bytes Sent,Connected Since (.*?) ROUTING TABLE Virtual Address,Common Name,Real Address,Last Ref (.*?) GLOBAL STATS Max bcast/mcast queue length,(.*?) END")
-        regclients := regexp.MustCompile("(.*),(.*),(.*),(.*),")
-        regroutes := regexp.MustCompile("(.*),(.*),(.*),")
-        regipport := regexp.MustCompile("(.*):(.*)")
-        s := regexp.MustCompile("((Mon|Tue|Thu|Wed|Fri|Sat|Sun) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \\d{1,2} \\d{2}:\\d{2}:\\d{2} \\d{4})").Split(reg.FindStringSubmatch(resline)[2], -1)
-        s2 := regexp.MustCompile("((Mon|Tue|Thu|Wed|Fri|Sat|Sun) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \\d{1,2} \\d{2}:\\d{2}:\\d{2} \\d{4})").Split(reg.FindStringSubmatch(resline)[3], -1)
-        resultstring = resultstring + "{" + "\"updated\": " + "\"" + reg.FindStringSubmatch(resline)[1] + "\"" + "," + "\"clients\": ["
-        for i := 0; i < len(s) - 1; i++ {
-                resclient = resclient + "{" + "\"client\": " + "\"" + regclients.FindStringSubmatch(s[i])[1] + "\"," + "\"remote\": " + "\"" + regipport.FindStringSubmatch(regclients.FindStringSubmatch(s[i])[2])[1] + "\"," + "\"bytes_received\": " + "\"" + regclients.FindStringSubmatch(s[i])[3] + "\"," + "\"bytes_sent\": " + "\"" + regclients.FindStringSubmatch(s[i])[4] + "\"}"
-                if i == len(s) - 2 { resclient = resclient + "]," } else { resclient = resclient + "," }
-        }
-        resultstring = resultstring + resclient
-        resultstring = resultstring + "\"routing\": ["
-        for i := 0; i < len(s2) - 1; i++ {
-                resroute = resroute + "{" + "\"local_ip\": " + "\"" + regroutes.FindStringSubmatch(s2[i])[1] + "\"," + "\"client\": " + "\"" + regroutes.FindStringSubmatch(s2[i])[2] + "\"," + "\"real_ip\" :" + "\"" + regipport.FindStringSubmatch(regroutes.FindStringSubmatch(s2[i])[3])[1] + "\"}"
-                if i == len(s2) - 2 { resroute = resroute + "]," } else { resroute = resroute + "," }
-        }
-        resultstring = resultstring + resroute
-        resultstring = resultstring + "\"max_bcast_mcast_queue\": " + "\"" + reg.FindStringSubmatch(resline)[4] + "\"}"
-        return resultstring
 }
