@@ -22,10 +22,10 @@ Example usage:
 
 Docker image :
 ```
-https://hub.docker.com/r/vaganovni/openvpn_exporter/
+https://hub.docker.com/r/supme/openvpn_exporter
 ```
 
 Docker usage :
 ```
-docker run -d -p 9509:9509 -v "/var/log/status.log:/var/log.status.log" vaganovni/openvpn_exporter
+docker run -d -p 9509:9509 -v "/var/log/openvpn/openvpn-status.log:/var/log/status.log" supme/openvpn_exporter
 ```

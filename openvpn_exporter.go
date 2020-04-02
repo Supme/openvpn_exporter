@@ -68,11 +68,11 @@ func init() {
 	prometheus.MustRegister(ovpnrouting)
 }
 
-type Body struct {
-	Updated            string    `json:"updated"`
-	Clients            []Client  `json:"clients"`
-	Routs              []Routing `json:"routing"`
-	MaxBcastMcastQueue string    `json:"max_bcast_mcast_queue"`
+type OVPN struct {
+	Updated            string   `json:"updated"`
+	Clients            []Client `json:"clients"`
+	Routing            []Route  `json:"routing"`
+	MaxBcastMcastQueue string   `json:"max_bcast_mcast_queue"`
 }
 
 type Client struct {
@@ -82,13 +82,13 @@ type Client struct {
 	BytesSent     string `json:"bytes_sent"`
 }
 
-type Routing struct {
+type Route struct {
 	LocalIP string `json:"local_ip"`
 	Client  string `json:"client"`
 	RealIP  string `json:"real_ip"`
 }
 
-func (b *Body) Parse(logfile string) error {
+func (ovpn *OVPN) Parse(logfile string) error {
 	file, err := os.OpenFile(logfile, os.O_RDONLY, 0444)
 	if err != nil {
 		return err
@@ -115,7 +115,7 @@ func (b *Body) Parse(logfile string) error {
 			if err != nil {
 				return fmt.Errorf("parse update time: %s", err)
 			}
-			b.Updated = t.String()
+			ovpn.Updated = t.String()
 			section = "client header"
 			break
 
@@ -138,8 +138,8 @@ func (b *Body) Parse(logfile string) error {
 				if len(fields) != 5 {
 					return fmt.Errorf("parse client line %s", s)
 				}
-				b.Clients = append(
-					b.Clients,
+				ovpn.Clients = append(
+					ovpn.Clients,
 					Client{
 						Client:        fields[0],
 						Remote:        fields[1],
@@ -168,9 +168,9 @@ func (b *Body) Parse(logfile string) error {
 				if len(fields) != 4 {
 					return fmt.Errorf("parse routing line %s", s)
 				}
-				b.Routs = append(
-					b.Routs,
-					Routing{
+				ovpn.Routing = append(
+					ovpn.Routing,
+					Route{
 						LocalIP: fields[0],
 						Client:  fields[1],
 						RealIP:  fields[2],
@@ -183,7 +183,7 @@ func (b *Body) Parse(logfile string) error {
 			if len(fields) != 2 {
 				return fmt.Errorf("unknow second line format")
 			}
-			b.MaxBcastMcastQueue = fields[1]
+			ovpn.MaxBcastMcastQueue = fields[1]
 			section = "end"
 			break
 
@@ -208,25 +208,25 @@ func main() {
 
 	go func() {
 		for {
-			var b Body
-			if err := b.Parse(*ovpnlog); err != nil {
+			var ovpn OVPN
+			if err := ovpn.Parse(*ovpnlog); err != nil {
 				log.Fatal("Parse log: ", err)
 			}
-			strmcast, _ := strconv.ParseFloat(b.MaxBcastMcastQueue, 64)
-			ovpnclientscount.Set(float64(len(b.Clients)))
+			strmcast, _ := strconv.ParseFloat(ovpn.MaxBcastMcastQueue, 64)
+			ovpnclientscount.Set(float64(len(ovpn.Clients)))
 			ovpnmaxbcastmcastqueue.Set(strmcast)
-			for i, _ := range b.Clients {
-				bytesr, _ := strconv.Atoi(b.Clients[i].BytesReceived)
-				bytess, _ := strconv.Atoi(b.Clients[i].BytesSent)
-				ovpnremote.WithLabelValues(b.Clients[i].Client, b.Clients[i].Remote).Set(float64(i + 1))
-				ovpnbytesr.WithLabelValues(b.Clients[i].Client, strconv.Itoa(i+1)).Set(float64(bytesr))
-				ovpnbytess.WithLabelValues(b.Clients[i].Client, strconv.Itoa(i+1)).Set(float64(bytess))
+			for i := range ovpn.Clients {
+				bytesr, _ := strconv.Atoi(ovpn.Clients[i].BytesReceived)
+				bytess, _ := strconv.Atoi(ovpn.Clients[i].BytesSent)
+				ovpnremote.WithLabelValues(ovpn.Clients[i].Client, ovpn.Clients[i].Remote).Set(float64(i + 1))
+				ovpnbytesr.WithLabelValues(ovpn.Clients[i].Client, strconv.Itoa(i+1)).Set(float64(bytesr))
+				ovpnbytess.WithLabelValues(ovpn.Clients[i].Client, strconv.Itoa(i+1)).Set(float64(bytess))
 			}
-			for i, _ := range b.Routs {
-				ovpnrouting.WithLabelValues(strconv.Itoa(i+1), b.Routs[i].Client, b.Routs[i].LocalIP, b.Routs[i].RealIP)
+			for i := range ovpn.Routing {
+				ovpnrouting.WithLabelValues(strconv.Itoa(i+1), ovpn.Routing[i].Client, ovpn.Routing[i].LocalIP, ovpn.Routing[i].RealIP)
 			}
 
-			time.Sleep(time.Duration(1000 * time.Millisecond))
+			time.Sleep(time.Duration(5 * time.Second))
 		}
 	}()
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
